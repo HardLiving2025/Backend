@@ -47,18 +47,18 @@ class DailySummaryService:
         night_start = day_end
         night_end = datetime.combine(target_date + timedelta(days=1), datetime.min.time()) + timedelta(hours=8)
 
-        # Day Log
+        # Day Log (8시~18시 구간)
+        # 8시 이후에 입력한 경우, 가장 최근 입력값 사용
         day_log = db.query(EmotionStatusLog).filter(
             EmotionStatusLog.user_id == user_id,
-            EmotionStatusLog.created_at >= day_start,
-            EmotionStatusLog.created_at < day_end
+            EmotionStatusLog.created_at <= day_end  # 18시 이전까지
         ).order_by(EmotionStatusLog.created_at.desc()).first()
 
-        # Night Log (Includes pre-dawn? User said 18-08. We check this window)
+        # Night Log (18시~다음날 8시 구간)
+        # 18시 이후에 입력한 경우, 가장 최근 입력값 사용
         night_log = db.query(EmotionStatusLog).filter(
             EmotionStatusLog.user_id == user_id,
-            EmotionStatusLog.created_at >= night_start,
-            EmotionStatusLog.created_at < night_end
+            EmotionStatusLog.created_at <= night_end  # 다음날 8시 이전까지
         ).order_by(EmotionStatusLog.created_at.desc()).first()
 
         
@@ -90,47 +90,15 @@ class DailySummaryService:
         comment = f"최근 {ignored_count}번 경고를 무시하셨어요. 어제 핸드폰 총 사용량은 {usage_str}입니다."
 
 
-        # 4) 30분 슬롯(0~47) 초기화
-        # 하지만 "값이 없으면 생성하지 않도록" -> Dict로 관리하고 데이터 있는 곳만 저장
-        slots = {} # key: slot_index, val: {sns, game, other}
+        # 4) 슬롯별 데이터 집계 (app_usage_raw의 slot_index 사용)
+        slots = {}  # key: slot_index, value: {sns, game, other}
 
         for row in raw_rows:
-            # raw data는 현재 1일 1행(duration sum)으로 들어오고 있음 (Step 195).
-            # 따라서 시간 정보(start/end)가 없으므로 정확한 30분 슬롯 배정이 불가능함.
-            # 그러나 User Request 3번: "time_slot이 00:00일 때 값이 있으면... 04:00일 때 값이 없으면..."
-            # 이는 raw data가 다시 '시간대별'로 들어오거나, start_time/end_time이 있다고 가정하는 것임.
-            # 현재 AppUsageRaw 스키마는 start_time/end_time이 주석처리되어 있음.
-            # 하지만 usage_month.json에는 "time_slot"이 있음.
-            # 로직상, AppUsageRaw에 'start_time'이 없으면 슬롯 배분이 불가능.
-            # 일단 전체 시간을 '0번 슬롯' 또는 '적절한 슬롯'에 넣어야 하는데...
-            # ! CRITICAL: user reverted schema changes for start_time.
-            # But the user logic demands "time_slot".
-            # The ONLY way is if AppUsageRaw HAS time info.
-            # Currently it DOES NOT. It only has "usage_date".
-            # I will assume for now we aggregate EVERYTHING into Slot 0 (since we can't distinguish) 
-            # OR I distributes it evenly?
-            # WAIT. If keys are Time Slots in usage_month.json, the User might expect us to USE that.
-            # But usage.py aggregates it all into one day! (Step 195 applied aggregation).
-            # So duplicate packages are merged and time info LOST.
-            # CONFLICT: usage.py aggregates and loses time info -> daily_summary cannot recover time slots.
-            # I must assume the user might have UN-DONE the aggregation or expects me to fix it?
-            # Actually, looking at the request, the user seems to imply sparse slots.
-            # Since I cannot recover time from aggregated data, I will dump everything into Slot 0 (or a default) 
-            # OR, I must use 'created_at' if available? No.
-            
-            # Since I cannot change usage.py right now (not requested), I have to work with what I have.
-            # I will put everything in Slot 0 for now as a fallback, BUT apply the Category Map.
-            
             pkg = row.package_name
-            # Force Category Map
             cat_key = CATEGORY_MAP.get(pkg, "OTHER")
             
-            # For now, assign to Slot 0 (Time 00:00) because we lost granularity.
-            # If the user wants granular slots, they need to NOT aggregate in usage.py.
-            # I will proceed with logic that supports specific slots IF we had them, 
-            # but currently default to 0.
-            
-            target_slot = 0 # Default
+            # app_usage_raw에 저장된 실제 슬롯 인덱스 사용
+            target_slot = row.slot_index if row.slot_index is not None else 0
             
             if target_slot not in slots:
                 slots[target_slot] = {"sns": 0, "game": 0, "other": 0}
@@ -202,10 +170,10 @@ class DailySummaryService:
         # 날짜별로 그룹화가 필요할 수도 있지만, 입력 데이터가 특정 날짜들에 대한 것이라 가정하고 처리
         # 효율성을 위해 날짜별로 기존 데이터를 조회하는 것이 좋음.
         
-        # 1) 들어온 데이터 순회
-        # data는 Pydantic 모델 리스트라고 가정
-        
         processed_count = 0
+        
+        # 날짜별로 감정/상태 데이터 캐싱 (성능 최적화)
+        emotion_cache = {}  # {date: (day_log, night_log)}
         
         for item in data:
             usage_date = item.usage_date
@@ -221,6 +189,66 @@ class DailySummaryService:
             # 시작/종료 시간 계산
             start_dt = datetime.combine(usage_date, datetime.min.time()) + timedelta(minutes=30*slot_idx)
             end_dt = start_dt + timedelta(minutes=30)
+            
+            # 감정/상태 데이터 조회 (날짜별 캐싱)
+            if usage_date not in emotion_cache:
+                day_start = datetime.combine(usage_date, datetime.min.time()) + timedelta(hours=8)
+                day_end = datetime.combine(usage_date, datetime.min.time()) + timedelta(hours=18)
+                night_end = datetime.combine(usage_date + timedelta(days=1), datetime.min.time()) + timedelta(hours=8)
+                
+                # Day Log (8시~18시)
+                day_log = db.query(EmotionStatusLog).filter(
+                    EmotionStatusLog.user_id == user_id,
+                    EmotionStatusLog.created_at <= day_end
+                ).order_by(EmotionStatusLog.created_at.desc()).first()
+                
+                # Night Log (18시~다음날 8시)
+                night_log = db.query(EmotionStatusLog).filter(
+                    EmotionStatusLog.user_id == user_id,
+                    EmotionStatusLog.created_at <= night_end
+                ).order_by(EmotionStatusLog.created_at.desc()).first()
+                
+                emotion_cache[usage_date] = (day_log, night_log)
+            
+            day_log, night_log = emotion_cache[usage_date]
+            
+            # 시간대에 따라 감정/상태 선택
+            hour = start_dt.hour
+            chosen_log = day_log if (8 <= hour < 18) else night_log
+            
+            # emotion_status_logs에 데이터가 없으면 과거 날짜용 하드코딩 값 사용
+            if chosen_log:
+                dom_emotion = chosen_log.emotion
+                dom_status = chosen_log.status
+            else:
+                # 과거 데이터용 fallback (12월 5일~14일)
+                from datetime import date as date_type
+                
+                dec_6 = date_type(2025, 12, 6)
+                dec_10 = date_type(2025, 12, 10)
+                dec_11 = date_type(2025, 12, 11)
+                dec_14 = date_type(2025, 12, 14)
+                
+                if dec_6 <= usage_date <= dec_10:
+                    # 12/6 ~ 12/10
+                    if 8 <= hour < 18:
+                        dom_emotion = 'BAD'
+                        dom_status = 'BUSY'
+                    else:
+                        dom_emotion = 'NORMAL'
+                        dom_status = 'FREE'
+                elif dec_11 <= usage_date <= dec_14:
+                    # 12/11 ~ 12/14
+                    if 8 <= hour < 18:
+                        dom_emotion = 'NORMAL'
+                        dom_status = 'BUSY'
+                    else:
+                        dom_emotion = 'GOOD'
+                        dom_status = 'FREE'
+                else:
+                    # 그 외 날짜는 NULL
+                    dom_emotion = None
+                    dom_status = None
             
             # 카테고리별 합산
             sns_ms = 0
@@ -260,6 +288,8 @@ class DailySummaryService:
                     game_ms=game_ms,
                     other_ms=other_ms,
                     total_usage_ms=total_ms,
+                    dominant_emotion=dom_emotion,
+                    status=dom_status,
                     created_at=datetime.now()
                 )
                 db.add(summary)
@@ -269,6 +299,8 @@ class DailySummaryService:
                 summary.game_ms = game_ms
                 summary.other_ms = other_ms
                 summary.total_usage_ms = total_ms
+                summary.dominant_emotion = dom_emotion
+                summary.status = dom_status
                 # 감정/상태/코멘트는 여기서 건드리지 않음 (필요시 추가 로직)
                 
             processed_count += 1

@@ -3,8 +3,9 @@ import base64
 import hmac
 import hashlib
 import time
+import os
 
-SECRET_KEY = "SUPER_SECRET_KEY"   # 나중에 꼭 환경변수로 변경 (중요)
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "FALLBACK_SECRET_KEY_FOR_DEVELOPMENT")
 ALGORITHM = "HS256"
 EXPIRE_MINUTES = 60 * 24 * 7   # 7일
 

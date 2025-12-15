@@ -22,6 +22,13 @@ APP_NAME_MAP = {
     "com.samsung.android.app.notes": "삼성 노트",
     "com.coupang.mobile": "쿠팡",
     "com.nhn.android.nmap": "네이버 지도",
+    "com.samsung.android.dialer": "알람",
+    "com.samsung.android.incallui": "통화",
+    "com.sec.android.app.camera": "카메라",
+    "com.sec.android.gallery3d": "갤러리",
+    "com.sec.android.app.launcher": "홈",
+    "com.android.settings": "설정",
+    "com.samsung.android.easysetup": "에이지 셋업",
     "com.kakaopay.app": "카카오페이"
 }
 

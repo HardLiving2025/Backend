@@ -42,8 +42,7 @@ def usage_by_slot_average(
     return get_average_usage_stats(db, current_user.user_id)
 
 
-
-# 4) 감정별 상태별 평균 사용량
+# 4) 감정별 상태별 총 사용량
 @router.get("/usage-by-emotion-status")
 def usage_by_emotion_status(
     current_user = Depends(get_current_user),

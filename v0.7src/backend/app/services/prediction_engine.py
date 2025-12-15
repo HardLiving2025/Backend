@@ -41,11 +41,12 @@ _ai_execution_lock = threading.Lock()
 
 class PredictionEngine:
 
-    # 1) 최근 7일 사용 기록 조회
+    # 1) 최근 사용 기록 조회
     @staticmethod
     def fetch_recent_usage(user_id: int, db: Session):
         end = date.today()
-        start = end - timedelta(days=7)
+        # User requested minimizing data. 2 days ensures we have >= 24h context.
+        start = end - timedelta(days=2) 
 
         rows = (
             db.query(AppUsageRaw)
@@ -67,6 +68,9 @@ class PredictionEngine:
             }
             for r in rows
         ]
+
+    # ... (call_ai_engine, determine_level, get_mood_description, get_recommendations omitted - no changes needed)
+
 
     # 2) AI 엔진 subprocess 호출 (Existing logic kept for Risk Score)
     @staticmethod
@@ -152,87 +156,87 @@ class PredictionEngine:
     # 6) 최종 Prediction 로직 (Updated)
     @staticmethod
     def predict(user, emotion: str, status: str, db: Session):
-
         user_id = user.user_id
 
         # 1) 최근 사용 기록
         seq = PredictionEngine.fetch_recent_usage(user_id, db)
 
-        # 2) AI 엔진 실행 (Risk Score)
+        # 2) AI 엔진 실행
+        # ai_result now contains: user_id, analysis_date, risk_analysis, usage_prediction, pattern_detection
         ai_result = PredictionEngine.call_ai_engine(emotion, status, seq)
-        score = ai_result.get("risk_score", 50.0)
-        hourly_forecast = ai_result.get("hourly_forecast", [])
+        
+        # Fallback if AI fails or returns legacy/error
+        if "risk_analysis" not in ai_result:
+            # Construct fallback structure
+            risk_analysis = {
+                "level": "LOW",
+                "score": 0,
+                "vulnerable_category": "NONE",
+                "condition": emotion,
+                "message": "AI 분석을 수행할 수 없습니다."
+            }
+            usage_prediction = {
+                "has_prediction": False,
+                "start_time": "00:00",
+                "end_time": "00:00",
+                "target_category": "NONE",
+                "probability_percent": 0.0
+            }
+            pattern_detection = {
+                "detected": False,
+                "pattern_code": "NONE",
+                "alert_message": ""
+            }
+            hourly_forecast = []
+        else:
+            risk_analysis = ai_result["risk_analysis"]
+            usage_prediction = ai_result["usage_prediction"]
+            pattern_detection = ai_result["pattern_detection"]
+            hourly_forecast = ai_result.get("hourly_forecast", [])
+            
+            # --- [NEW] Identify Specific Vulnerable App ---
+            # AI gives 'SNS', we want 'Instagram' from seq history
+            vuln_cat = risk_analysis.get("vulnerable_category", "NONE")
+            
+            if vuln_cat not in ["NONE", "OTHER"]:
+                # Filter sequence for this category
+                # seq item: {category, package_name, duration_ms}
+                relevant_apps = {}
+                for item in seq:
+                    # Clean comparison (item['category'] might be 'SNS' or logic needed?)
+                    # Assuming item['category'] aligns with model output
+                    if item.get("category") == vuln_cat:
+                        pkg = item.get("package_name", "Unknown")
+                        dur = item.get("duration_ms", 0)
+                        relevant_apps[pkg] = relevant_apps.get(pkg, 0) + dur
+                
+                # Find max
+                if relevant_apps:
+                    top_app = max(relevant_apps, key=relevant_apps.get)
+                    # Clean Name: com.instagram.android -> Instagram
+                    simple_name = top_app.split('.')[-1].capitalize()
+                    
+                    # Update Risk Analysis
+                    risk_analysis["vulnerable_category"] = f"{simple_name} ({vuln_cat})"
+                    
+                    # Update Usage Prediction too if matches
+                    if usage_prediction.get("target_category") == vuln_cat:
+                         usage_prediction["target_category"] = f"{simple_name} ({vuln_cat})"
+            # ---------------------------------------------
 
-        # 3) 위험 등급
-        level = PredictionEngine.determine_level(score)
-
-        # 4) 사용자 피드백 메시지 (Legacy Notification Logic)
-        msg = MessageManager.get_message(level, emotion, status)
-
-        # 5) 알림 빈도 제한 체크 (Settings 없이 기본 규칙 적용)
-        try:
-            if level in ["DANGER", "CAUTION"]:
-                if can_send_notification(db, user_id):
-                    save_notification_log(db, user_id, f"RISK_{level}")
-        except Exception as e:
-            print(f"[WARNING] Notification logging failed: {e}")
-
-        # --- New Features ---
+        # 3) Generate Recommendations (Backend Logic)
+        level_map = {"HIGH": "DANGER", "MODERATE": "CAUTION", "LOW": "SAFE"}
+        legacy_level = level_map.get(risk_analysis["level"], "SAFE")
         
-        # 6) Mood Description
-        mood_desc = PredictionEngine.get_mood_description(emotion, status)
+        recs = PredictionEngine.get_recommendations(legacy_level, emotion)
         
-        # 7) Pattern & Time Analysis using internal Pattern Analyzer
-        # We need to simulate 'Emotion Data' for the analyzer.
-        # The analyzer expects a list of {date, emotion}. 
-        # Since we are predicting for 'Today' (or based on recent history context), we can pass recent usage with their historical emotions?
-        # Actually pattern analyzer finds correlations. 
-        # If we pass current `seq` (7 days usage) and we don't have emotions for those days handy here (fetched only usage),
-        # we should fetch emotions too.
-        # But for simplicity, let's suggest patterns based on "Today's Emotion". 
-        # Actually pattern analyzer takes HISTORY.
-        # So we should fetch history emotions.
-        # Let's quickly query last 7 days emotions.
-        from app.models.daily_summary import DailySummary
-        end = date.today()
-        start = end - timedelta(days=7)
-        emo_rows = db.query(DailySummary.date, DailySummary.dominant_emotion).filter(
-             DailySummary.user_id == user_id,
-             DailySummary.date.between(start, end)
-        ).all()
-        
-        emo_data = [{"date": str(r.date), "emotion": r.dominant_emotion} for r in emo_rows if r.dominant_emotion]
-        
-        # Run Analyzer
-        # It returns list of {title, content}
-        patterns = analyze_patterns(seq, emo_data)
-        
-        # Time Prediction
-        # Helper to extract time specific string? 
-        # Pattern analyzer returns general patterns. 
-        # Required: "어느 시간대에 어떤 앱 사용 가능성이 높은 것인지"
-        # If pattern analyzer returned a time-based pattern (e.g. "20-21시 집중 사용"), we can stick it here.
-        # Or we can create a specific string based on logic.
-        # Let's extract the first "Time" related pattern from `patterns` if available.
-        # Or assume Peak Hour from usage data.
-        time_pred = "현재 시간대 분석 정보가 부족합니다."
-        for p in patterns:
-            if "집중 사용" in p["title"]:
-                time_pred = f"오늘 {p['title']} 가능성이 높습니다. ({p['content']})"
-                break
-        
-        # 8) Recommendations
-        recs = PredictionEngine.get_recommendations(level, emotion)
-
+        # 4) Construct Final Response
         return {
-            "risk_score": score,
-            "risk_level": level,
-            "message_title": msg["title"],
-            "message_body": msg["body"],
-            "hourly_forecast": hourly_forecast,
-            # New Keys
-            "mood_description": mood_desc,
-            "patterns": patterns,
-            "time_prediction": time_pred,
-            "recommendations": recs
+            "user_id": user_id,
+            "analysis_date": ai_result.get("analysis_date", str(date.today() + timedelta(days=1))),
+            "risk_analysis": risk_analysis,
+            "usage_prediction": usage_prediction,
+            "pattern_detection": pattern_detection,
+            "hourly_forecast": hourly_forecast, # For Graph
+            "recommendations": recs, # Value add
         }

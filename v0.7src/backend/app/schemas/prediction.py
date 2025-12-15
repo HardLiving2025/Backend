@@ -7,14 +7,33 @@ class PredictionRequest(BaseModel):
     status: str       # 'BUSY' | 'FREE'
 
 
+
+class RiskAnalysis(BaseModel):
+    level: str
+    score: int
+    vulnerable_category: str
+    condition: str
+    message: str
+
+class UsagePrediction(BaseModel):
+    has_prediction: bool
+    start_time: str
+    end_time: str
+    target_category: str
+    probability_percent: float
+
+class PatternDetection(BaseModel):
+    detected: bool
+    pattern_code: str
+    alert_message: str
+
 class PredictionResponse(BaseModel):
-    risk_score: float
-    risk_level: str
-    message_title: str
-    message_body: str
+    user_id: int
+    analysis_date: str
     
-    # New fields
-    mood_description: str
-    patterns: list[dict] # {title, content}
-    time_prediction: str
+    risk_analysis: RiskAnalysis
+    usage_prediction: UsagePrediction
+    pattern_detection: PatternDetection
+    
+    hourly_forecast: list[float]
     recommendations: list[str]
